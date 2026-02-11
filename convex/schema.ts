@@ -7,4 +7,10 @@ export default defineSchema({
     imageUrl: v.string(),
     email: v.string(),
   }),
+  Interviews: defineTable({
+    userId: v.string(),
+    jobDescription: v.string(),
+    resumeFileName: v.string(),
+    createdAt: v.number(),
+  }),
 });
