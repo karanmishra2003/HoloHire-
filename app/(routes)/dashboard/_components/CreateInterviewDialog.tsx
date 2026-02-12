@@ -71,6 +71,7 @@ export default function CreateInterviewDialog({
         });
 
         resumeUrl = uploadResponse.url;
+        console.log("✅ Resume uploaded to ImageKit:", resumeUrl);
       }
 
       // ── Save interview record to Convex ──
@@ -80,6 +81,39 @@ export default function CreateInterviewDialog({
         resumeFileName: resumeFile?.name ?? "No resume uploaded",
         resumeUrl,
       });
+
+      // ── Call n8n webhook to generate interview questions ──
+      if (resumeUrl) {
+        const formData = new FormData();
+        formData.append("resumeUrl", resumeUrl);
+        const res = await fetch("/api/generate-interview-questions", {
+          method: "POST",
+          body: formData,
+        });
+        const questionsData = await res.json();
+        const rawText = questionsData?.data?.content?.parts?.[0]?.text
+          || questionsData?.data?.[0]?.content?.parts?.[0]?.text
+          || questionsData?.data?.text
+          || "";
+        // Extract JSON array from the raw text
+        const jsonMatch = rawText.match(/\[[\s\S]*\]/);
+        const qnaList = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+        console.log("📋 Interview Questions & Answers:", qnaList);
+      } else if (jobDescription.trim()) {
+        const res = await fetch("/api/generate-interview-questions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ description: jobDescription.trim() }),
+        });
+        const questionsData = await res.json();
+        const rawText = questionsData?.data?.content?.parts?.[0]?.text
+          || questionsData?.data?.[0]?.content?.parts?.[0]?.text
+          || questionsData?.data?.text
+          || "";
+        const jsonMatch = rawText.match(/\[[\s\S]*\]/);
+        const qnaList = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+        console.log("📋 Interview Questions & Answers:", qnaList);
+      }
 
       // Reset state
       setJobDescription("");
@@ -125,8 +159,8 @@ export default function CreateInterviewDialog({
           <button
             onClick={() => setActiveTab("resume")}
             className={`rounded-full px-5 py-2 text-sm font-medium transition ${activeTab === "resume"
-                ? "bg-white/10 text-white border border-white/20"
-                : "text-gray-400 border border-transparent hover:text-white hover:bg-white/5"
+              ? "bg-white/10 text-white border border-white/20"
+              : "text-gray-400 border border-transparent hover:text-white hover:bg-white/5"
               }`}
           >
             Resume Upload
@@ -134,8 +168,8 @@ export default function CreateInterviewDialog({
           <button
             onClick={() => setActiveTab("job")}
             className={`rounded-full px-5 py-2 text-sm font-medium transition ${activeTab === "job"
-                ? "bg-white/10 text-white border border-white/20"
-                : "text-gray-400 border border-transparent hover:text-white hover:bg-white/5"
+              ? "bg-white/10 text-white border border-white/20"
+              : "text-gray-400 border border-transparent hover:text-white hover:bg-white/5"
               }`}
           >
             Job Description
