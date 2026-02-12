@@ -7,12 +7,14 @@ export const CreateInterview = mutation({
     userId: v.string(),
     jobDescription: v.string(),
     resumeFileName: v.string(),
+    resumeUrl: v.optional(v.string()),
   },
   async handler(ctx, args) {
     const id = await ctx.db.insert("Interviews", {
       userId: args.userId,
       jobDescription: args.jobDescription,
       resumeFileName: args.resumeFileName,
+      resumeUrl: args.resumeUrl,
       createdAt: Date.now(),
     });
 
