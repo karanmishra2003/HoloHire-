@@ -13,7 +13,7 @@ import { api } from "@/convex/_generated/api";
 import { Id } from "@/convex/_generated/dataModel";
 import { UserDetailContext } from "@/context/UserDetailContext";
 import Vapi from "@vapi-ai/web";
-import { Loader2, MessageCircle } from "lucide-react";
+import { Loader2, Volume2, Clock, PhoneOff } from "lucide-react";
 
 /* ─── Types ─── */
 interface QuestionItem {
@@ -38,15 +38,24 @@ export default function LiveInterviewPage() {
     const videoRef = useRef<HTMLVideoElement>(null);
     const vapiRef = useRef<Vapi | null>(null);
     const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const callEndedRef = useRef(false);
+    const cleanupCalledRef = useRef(false);
 
     /* ─── State ─── */
     const [stream, setStream] = useState<MediaStream | null>(null);
     const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
     const [questions, setQuestions] = useState<QuestionItem[]>([]);
-    const [transcript, setTranscript] = useState("Connecting to AI interviewer…");
     const [isEnding, setIsEnding] = useState(false);
     const [timeLeft, setTimeLeft] = useState(QUESTION_TIME_SECONDS);
+
+    // Vapi / Connection States
     const [vapiConnected, setVapiConnected] = useState(false);
+    const [aiIsSpeaking, setAiIsSpeaking] = useState(false);
+    const [userIsSpeaking, setUserIsSpeaking] = useState(false);
+    const [timerStarted, setTimerStarted] = useState(false);
+
+    // Live transcript from AI — this is what the question card displays
+    const [liveAiText, setLiveAiText] = useState("");
 
     /* ─── Parse questions from Convex ─── */
     useEffect(() => {
@@ -54,12 +63,8 @@ export default function LiveInterviewPage() {
             try {
                 const parsed = JSON.parse(interview.questions);
                 setQuestions(parsed);
-                if (parsed.length > 0) {
-                    setTranscript(parsed[0].question || "Tell me about yourself.");
-                }
             } catch {
                 setQuestions([]);
-                setTranscript("Tell me about yourself.");
             }
         }
     }, [interview?.questions]);
@@ -99,6 +104,10 @@ export default function LiveInterviewPage() {
             return;
         }
 
+        // Reset flags for this effect lifecycle
+        callEndedRef.current = false;
+        cleanupCalledRef.current = false;
+
         const vapi = new Vapi(publicKey);
         vapiRef.current = vapi;
 
@@ -115,6 +124,7 @@ Instructions:
 - Greet the candidate warmly first.
 - Ask question 1, then wait for their answer.
 - After they answer (or if they seem stuck), briefly acknowledge and move to the next question.
+- If the candidate says "I don't know", "skip this", or "next question", acknowledge briefly and move to the next question immediately.
 - Keep your responses concise and professional.
 - Do NOT reveal the answers.
 - After all questions, thank the candidate and say the interview is concluded.`;
@@ -134,43 +144,90 @@ Instructions:
                 "Hello! Welcome to your HoloHire interview. I'm your AI interviewer today. Let's get started. Are you ready?",
         });
 
+        /* ── Event Listeners ── */
         vapi.on("call-start", () => {
             setVapiConnected(true);
-            startTimer();
+        });
+
+        vapi.on("speech-start", () => {
+            setAiIsSpeaking(true);
+            setUserIsSpeaking(false);
+            // Pause the timer while AI is speaking
+            if (timerRef.current) clearInterval(timerRef.current);
+        });
+
+        vapi.on("speech-end", () => {
+            setAiIsSpeaking(false);
         });
 
         vapi.on("message", (msg: any) => {
-            if (msg.role === "assistant" && msg.content) {
-                setTranscript(msg.content);
+            /* ── Real-time AI transcript → Question Card ── */
+            if (msg.type === "transcript" && msg.role === "assistant") {
+                setLiveAiText(msg.transcript);
+                // Detect question advancement from AI speech
                 for (let i = currentQuestionIndex + 1; i < questions.length; i++) {
                     const qText = questions[i].question.slice(0, 30);
-                    if (msg.content.includes(qText)) {
+                    if (msg.transcript.includes(qText)) {
                         advanceQuestion(i);
                         break;
+                    }
+                }
+            }
+
+            /* ── User transcript → start timer + skip detection ── */
+            if (msg.type === "transcript" && msg.role === "user") {
+                if (msg.transcriptType === "partial" && !userIsSpeaking) {
+                    setUserIsSpeaking(true);
+                    startTimer();
+                }
+                if (msg.transcriptType === "final") {
+                    const text = msg.transcript.toLowerCase();
+                    const skipPhrases = [
+                        "i don't know", "i'm not sure", "i can't answer",
+                        "skip this", "pass", "next question",
+                    ];
+                    if (skipPhrases.some((p: string) => text.includes(p))) {
+                        handleSkipQuestion();
                     }
                 }
             }
         });
 
         vapi.on("call-end", () => {
+            callEndedRef.current = true;
             setVapiConnected(false);
             cleanupAndRedirect();
         });
 
         vapi.on("error", (err: any) => {
+            // Suppress known "meeting ejection" errors during normal call teardown
+            const errMsg = typeof err === "string" ? err : err?.message || String(err);
+            if (errMsg.includes("ejection") || errMsg.includes("Meeting has ended")) {
+                return;
+            }
             console.error("Vapi error:", err);
         });
 
         return () => {
-            vapi.stop();
+            if (!callEndedRef.current) {
+                try {
+                    vapi.stop();
+                } catch {
+                    // Call already ended — safe to ignore
+                }
+            }
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [questions]);
 
-    /* ─── Timer ─── */
+    /* ─── Timer Logic ─── */
     const startTimer = useCallback(() => {
         if (timerRef.current) clearInterval(timerRef.current);
-        setTimeLeft(QUESTION_TIME_SECONDS);
+        if (!timerStarted) {
+            setTimerStarted(true);
+            setTimeLeft(QUESTION_TIME_SECONDS);
+        }
+
         timerRef.current = setInterval(() => {
             setTimeLeft((prev) => {
                 if (prev <= 1) {
@@ -181,43 +238,57 @@ Instructions:
                 return prev - 1;
             });
         }, 1000);
-    }, []);
+    }, [timerStarted]);
 
     const handleTimerExpired = () => {
-        setCurrentQuestionIndex((prev) => {
-            const next = prev + 1;
-            if (next >= questions.length) {
-                vapiRef.current?.send({
-                    type: "add-message",
-                    message: {
-                        role: "system",
-                        content:
-                            "The timer for the final question has ended. Please wrap up and thank the candidate.",
-                    },
-                });
-                return prev;
-            }
+        const next = currentQuestionIndex + 1;
+        if (next < questions.length) {
             vapiRef.current?.send({
                 type: "add-message",
                 message: {
                     role: "system",
-                    content: `Time is up. Please move on to question ${next + 1}: "${questions[next].question}"`,
+                    content: `Time is up. Move to question ${next + 1}: "${questions[next].question}"`,
                 },
             });
-            setTranscript(questions[next].question);
-            startTimer();
-            return next;
-        });
+            advanceQuestion(next);
+        } else {
+            vapiRef.current?.send({
+                type: "add-message",
+                message: {
+                    role: "system",
+                    content: "Time is up for the final question. Conclude the interview.",
+                },
+            });
+        }
+    };
+
+    const handleSkipQuestion = () => {
+        const next = currentQuestionIndex + 1;
+        if (next < questions.length) {
+            vapiRef.current?.send({
+                type: "add-message",
+                message: {
+                    role: "system",
+                    content: "User requested to skip. Acknowledge briefly and ask the next question immediately.",
+                },
+            });
+            advanceQuestion(next);
+        }
     };
 
     const advanceQuestion = (idx: number) => {
         setCurrentQuestionIndex(idx);
-        setTranscript(questions[idx].question);
-        startTimer();
+        setTimeLeft(QUESTION_TIME_SECONDS);
+        setUserIsSpeaking(false);
+        setTimerStarted(false);
+        setLiveAiText("");
+        if (timerRef.current) clearInterval(timerRef.current);
     };
 
-    /* ─── End interview ─── */
+    /* ─── Cleanup ─── */
     const cleanupAndRedirect = () => {
+        if (cleanupCalledRef.current) return;
+        cleanupCalledRef.current = true;
         if (timerRef.current) clearInterval(timerRef.current);
         stream?.getTracks().forEach((t) => t.stop());
         router.push("/dashboard");
@@ -230,7 +301,7 @@ Instructions:
     };
 
     /* ─── Helpers ─── */
-    const userName = user?.fullName || user?.firstName || "You";
+    const userName = user?.fullName || user?.firstName || "Candidate";
     const userImageUrl = user?.imageUrl;
 
     const formatTime = (s: number) => {
@@ -238,6 +309,19 @@ Instructions:
         const sec = s % 60;
         return `${m}:${sec.toString().padStart(2, "0")}`;
     };
+
+    const currentQuestion = questions[currentQuestionIndex]?.question ?? "";
+    // Show live AI text if available, otherwise show the stored question
+    const displayedQuestion = liveAiText || currentQuestion;
+
+    const timerColor =
+        timeLeft <= 15 ? "text-red-400" :
+            timeLeft <= 30 ? "text-amber-400" :
+                "text-white";
+    const timerBg =
+        timeLeft <= 15 ? "bg-red-500/15 border-red-500/30" :
+            timeLeft <= 30 ? "bg-amber-500/15 border-amber-500/30" :
+                "bg-white/5 border-white/10";
 
     /* ─── Loading ─── */
     if (!interview) {
@@ -249,110 +333,139 @@ Instructions:
     }
 
     return (
-        <div className="flex min-h-screen flex-col bg-[#0a0e17] text-white">
+        <div className="flex h-screen flex-col bg-[#0a0e17] text-white overflow-hidden">
             {/* ── Header ── */}
-            <header className="px-8 pt-6 pb-2">
-                <div className="flex items-center gap-3">
-                    <div className="flex size-9 items-center justify-center rounded-full bg-white">
-                        <MessageCircle className="size-5 text-[#0a0e17]" />
-                    </div>
-                    <span className="text-xl font-bold tracking-tight">HoloHire</span>
-                </div>
-            </header>
-
-            {/* ── Main ── */}
-            <main className="flex flex-1 flex-col px-8 pb-8">
-                {/* Label */}
-                <h2 className="mt-4 mb-6 text-base font-semibold text-gray-200">
-                    Interview Generation
-                </h2>
-
-                {/* ── Two cards side by side ── */}
-                <div className="grid flex-1 grid-cols-1 gap-5 md:grid-cols-2"
-                    style={{ minHeight: "380px" }}>
-                    {/* AI Interviewer */}
-                    <div className="relative flex flex-col items-center justify-center rounded-2xl border border-[#2a3a6a]/60 bg-gradient-to-br from-[#101c42] via-[#0e1835] to-[#0b1025]">
-                        {/* Icon */}
-                        <div className="mb-5 flex size-[88px] items-center justify-center rounded-full bg-white shadow-lg">
-                            <MessageCircle className="size-11 text-[#0a0e17]" />
-                        </div>
-                        <p className="text-lg font-semibold">AI Interviewer</p>
-
-                        {/* Timer badge — top-right corner */}
-                        {vapiConnected && (
-                            <div className="absolute right-4 top-4 flex items-center gap-1.5 rounded-full bg-black/40 px-3 py-1 backdrop-blur-sm">
-                                <span
-                                    className={`font-mono text-xs font-semibold ${timeLeft <= 15
-                                        ? "text-red-400"
-                                        : timeLeft <= 30
-                                            ? "text-amber-400"
-                                            : "text-cyan-400"
-                                        }`}
-                                >
-                                    {formatTime(timeLeft)}
-                                </span>
-                            </div>
-                        )}
-
-                        {/* Question badge — bottom */}
+            <header className="shrink-0 border-b border-white/5 bg-[#0a0e17]/90 backdrop-blur-lg px-6 py-3">
+                <div className="flex items-center justify-between max-w-7xl mx-auto">
+                    {/* Left: Brand */}
+                    <div className="flex items-center gap-3">
+                        <svg width="28" height="28" viewBox="0 0 36 36" fill="none">
+                            <circle cx="14" cy="18" r="11" fill="#3B82F6" opacity="0.6" />
+                            <circle cx="22" cy="18" r="11" fill="#60A5FA" />
+                        </svg>
+                        <span className="text-lg font-bold tracking-tight">HoloHire</span>
                         {questions.length > 0 && (
-                            <span className="mt-3 text-xs text-cyan-400">
-                                Question {currentQuestionIndex + 1} / {questions.length}
+                            <span className="ml-2 text-xs font-medium text-gray-500">
+                                Q{currentQuestionIndex + 1}/{questions.length}
                             </span>
                         )}
                     </div>
 
-                    {/* User / Candidate */}
-                    <div className="relative flex flex-col items-center justify-center rounded-2xl border border-white/[0.08] bg-[#111827]">
-                        {/* Circular live webcam feed */}
-                        <div className="mb-5 size-[88px] overflow-hidden rounded-full ring-2 ring-white/10">
-                            {stream ? (
-                                <video
-                                    ref={videoRef}
-                                    autoPlay
-                                    muted
-                                    playsInline
-                                    className="size-full object-cover"
-                                />
-                            ) : userImageUrl ? (
-                                <img
-                                    src={userImageUrl}
-                                    alt={userName}
-                                    className="size-full object-cover"
-                                />
-                            ) : (
-                                <div className="flex size-full items-center justify-center bg-gradient-to-br from-cyan-500 to-blue-600 text-2xl font-bold uppercase">
-                                    {userName.charAt(0)}
-                                </div>
-                            )}
-                        </div>
-                        <p className="text-lg font-semibold">{userName}</p>
+                    {/* Center: Answer Timer (replaces Live indicator) */}
+                    <div className={`flex items-center gap-2.5 px-4 py-2 rounded-full border transition-all duration-300 ${timerBg}`}>
+                        <Clock className={`size-4 ${timerColor}`} />
+                        <span className={`font-mono text-sm font-bold tabular-nums ${timerColor}`}>
+                            {formatTime(timeLeft)}
+                        </span>
+                        {timerStarted && (
+                            <div className="size-2 rounded-full bg-green-500 animate-pulse" />
+                        )}
                     </div>
-                </div>
 
-                {/* ── Transcript bar ── */}
-                <div className="mt-5 rounded-xl border border-white/[0.08] bg-white/[0.03] px-6 py-4">
-                    <p className="text-center text-sm italic text-gray-300 leading-relaxed">
-                        {transcript}
-                    </p>
-                </div>
-
-                {/* ── End button ── */}
-                <div className="mt-5 flex justify-center">
+                    {/* Right: End Interview */}
                     <button
                         onClick={handleEnd}
                         disabled={isEnding}
-                        className="rounded-full bg-red-500 px-10 py-2.5 text-sm font-bold text-white shadow-lg shadow-red-500/20 transition hover:bg-red-400 disabled:opacity-50"
+                        className="flex items-center gap-2 rounded-full border border-red-500/30 bg-red-500/10 px-5 py-2 text-sm font-semibold text-red-400 transition-all hover:bg-red-500/20 hover:border-red-500/50 hover:text-red-300 disabled:opacity-50 disabled:pointer-events-none"
                     >
                         {isEnding ? (
-                            <span className="flex items-center gap-2">
-                                <Loader2 className="size-4 animate-spin" />
-                                Ending…
-                            </span>
+                            <Loader2 className="size-4 animate-spin" />
                         ) : (
-                            "End"
+                            <PhoneOff className="size-4" />
                         )}
+                        {isEnding ? "Ending…" : "End Interview"}
                     </button>
+                </div>
+            </header>
+
+            {/* ── Main: Two Side-by-Side Cards ── */}
+            <main className="flex-1 flex flex-col min-h-0 p-4 gap-4">
+                <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4 min-h-0">
+
+                    {/* ── AI Interviewer Card ── */}
+                    <div className="relative flex flex-col items-center justify-center rounded-2xl bg-gradient-to-br from-[#1e293b] to-[#0f172a] border border-white/10 overflow-hidden">
+                        {/* Background Glow */}
+                        <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_30%,rgba(56,189,248,0.08),transparent_60%)]" />
+
+                        {/* Avatar + Name */}
+                        <div className="relative flex flex-col items-center gap-5 z-10">
+                            <div className="relative">
+                                <div className={`flex size-28 items-center justify-center rounded-full bg-white/10 backdrop-blur-sm border border-white/20 transition-all duration-300 ${aiIsSpeaking ? 'scale-105 shadow-[0_0_50px_rgba(59,130,246,0.4)]' : ''}`}>
+                                    <Volume2 className={`size-10 text-cyan-400 transition-transform duration-300 ${aiIsSpeaking ? 'scale-110' : ''}`} />
+                                </div>
+                                {aiIsSpeaking && (
+                                    <>
+                                        <div className="absolute inset-0 rounded-full border-2 border-cyan-500/40 animate-[ping_1.5s_ease-in-out_infinite]" />
+                                        <div className="absolute inset-0 rounded-full border border-cyan-500/20 animate-[ping_2s_ease-in-out_infinite_0.5s]" />
+                                    </>
+                                )}
+                            </div>
+                            <div className="text-center">
+                                <h3 className="text-xl font-bold text-white">AI Interviewer</h3>
+                                <p className="text-xs text-gray-500 mt-0.5">HoloHire Assistant</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* ── User Webcam Card ── */}
+                    <div className="relative rounded-2xl bg-[#111827] border border-white/10 overflow-hidden">
+                        {stream ? (
+                            <video
+                                ref={videoRef}
+                                autoPlay
+                                muted
+                                playsInline
+                                className="size-full object-cover scale-x-[-1]"
+                            />
+                        ) : (
+                            <div className="flex size-full items-center justify-center bg-[#1f2937]">
+                                <Loader2 className="size-8 animate-spin text-gray-500" />
+                            </div>
+                        )}
+
+                        {/* Name Badge */}
+                        <div className="absolute bottom-4 left-4">
+                            <div className="bg-black/50 backdrop-blur-md rounded-lg px-3 py-1.5 border border-white/10 flex items-center gap-2">
+                                {userImageUrl ? (
+                                    <img src={userImageUrl} alt="User" className="size-5 rounded-full" />
+                                ) : (
+                                    <div className="size-5 rounded-full bg-cyan-500 flex items-center justify-center text-[9px] font-bold">
+                                        {userName.charAt(0)}
+                                    </div>
+                                )}
+                                <span className="text-xs font-medium">{userName}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                {/* ── Current Question Bar (synced to AI speech) ── */}
+                <div className={`shrink-0 rounded-xl border transition-all duration-500 ${aiIsSpeaking
+                    ? 'border-cyan-500/30 bg-cyan-500/5'
+                    : 'border-white/10 bg-white/[0.03]'
+                    }`}>
+                    <div className="px-6 py-4 flex items-start gap-4">
+                        <div className="shrink-0 mt-0.5">
+                            <div className={`flex size-8 items-center justify-center rounded-full transition-colors duration-300 ${aiIsSpeaking ? 'bg-cyan-500/20' : 'bg-white/5'
+                                }`}>
+                                <Volume2 className={`size-4 transition-colors duration-300 ${aiIsSpeaking ? 'text-cyan-400 animate-pulse' : 'text-gray-500'
+                                    }`} />
+                            </div>
+                        </div>
+                        <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 mb-1">
+                                <span className="text-[10px] font-bold text-cyan-400 tracking-widest uppercase">
+                                    Question {currentQuestionIndex + 1} of {questions.length}
+                                </span>
+                                {aiIsSpeaking && (
+                                    <span className="text-[10px] text-cyan-400/60 font-medium">● Speaking</span>
+                                )}
+                            </div>
+                            <p className="text-sm text-gray-200 leading-relaxed">
+                                {displayedQuestion || "Waiting for the interviewer..."}
+                            </p>
+                        </div>
+                    </div>
                 </div>
             </main>
         </div>
