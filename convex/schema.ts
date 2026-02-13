@@ -12,6 +12,8 @@ export default defineSchema({
     jobDescription: v.string(),
     resumeFileName: v.string(),
     resumeUrl: v.optional(v.string()),
+    questions: v.optional(v.string()),
+    status: v.optional(v.string()),
     createdAt: v.number(),
   }),
 });

@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
+import { useRouter } from "next/navigation";
 import { X, Upload, FileText, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useMutation } from "convex/react";
@@ -20,6 +21,7 @@ export default function CreateInterviewDialog({
   userId,
   onCreated,
 }: CreateInterviewDialogProps) {
+  const router = useRouter();
   const [activeTab, setActiveTab] = useState<"resume" | "job">("resume");
   const [jobDescription, setJobDescription] = useState("");
   const [resumeFile, setResumeFile] = useState<File | null>(null);
@@ -27,6 +29,7 @@ export default function CreateInterviewDialog({
   const [uploadProgress, setUploadProgress] = useState(0);
 
   const createInterview = useMutation(api.Interviews.CreateInterview);
+  const updateQuestions = useMutation(api.Interviews.UpdateQuestions);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -75,14 +78,17 @@ export default function CreateInterviewDialog({
       }
 
       // ── Save interview record to Convex ──
-      await createInterview({
+      const interviewId = await createInterview({
         userId,
         jobDescription: jobDescription.trim(),
         resumeFileName: resumeFile?.name ?? "No resume uploaded",
         resumeUrl,
+        status: "pending",
       });
 
       // ── Call n8n webhook to generate interview questions ──
+      let questionsJson = "[]";
+
       if (resumeUrl) {
         const formData = new FormData();
         formData.append("resumeUrl", resumeUrl);
@@ -95,9 +101,10 @@ export default function CreateInterviewDialog({
           || questionsData?.data?.[0]?.content?.parts?.[0]?.text
           || questionsData?.data?.text
           || "";
-        // Extract JSON array from the raw text
         const jsonMatch = rawText.match(/\[[\s\S]*\]/);
-        const qnaList = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+        const cleanedJson = jsonMatch ? jsonMatch[0].replace(/[\x00-\x1F\x7F]/g, (ch: string) => ch === '\n' || ch === '\r' || ch === '\t' ? ' ' : '') : '[]';
+        const qnaList = JSON.parse(cleanedJson);
+        questionsJson = JSON.stringify(qnaList);
         console.log("📋 Interview Questions & Answers:", qnaList);
       } else if (jobDescription.trim()) {
         const res = await fetch("/api/generate-interview-questions", {
@@ -111,8 +118,18 @@ export default function CreateInterviewDialog({
           || questionsData?.data?.text
           || "";
         const jsonMatch = rawText.match(/\[[\s\S]*\]/);
-        const qnaList = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+        const cleanedJson = jsonMatch ? jsonMatch[0].replace(/[\x00-\x1F\x7F]/g, (ch: string) => ch === '\n' || ch === '\r' || ch === '\t' ? ' ' : '') : '[]';
+        const qnaList = JSON.parse(cleanedJson);
+        questionsJson = JSON.stringify(qnaList);
         console.log("📋 Interview Questions & Answers:", qnaList);
+      }
+
+      // ── Store questions in Convex ──
+      if (questionsJson !== "[]") {
+        await updateQuestions({
+          interviewId,
+          questions: questionsJson,
+        });
       }
 
       // Reset state
@@ -122,6 +139,9 @@ export default function CreateInterviewDialog({
       setUploadProgress(0);
       onCreated?.();
       onClose();
+
+      // ── Redirect to interview start page ──
+      router.push(`/interview/${interviewId}`);
     } catch (err) {
       console.error("Failed to create interview:", err);
     } finally {
@@ -256,10 +276,11 @@ export default function CreateInterviewDialog({
             {loading ? (
               <Loader2 className="size-4 animate-spin" />
             ) : null}
-            {loading ? "Uploading…" : "Submit"}
+            {loading ? "Processing…" : "Submit"}
           </Button>
         </div>
       </div>
     </div>
   );
 }
+

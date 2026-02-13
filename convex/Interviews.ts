@@ -8,6 +8,8 @@ export const CreateInterview = mutation({
     jobDescription: v.string(),
     resumeFileName: v.string(),
     resumeUrl: v.optional(v.string()),
+    questions: v.optional(v.string()),
+    status: v.optional(v.string()),
   },
   async handler(ctx, args) {
     const id = await ctx.db.insert("Interviews", {
@@ -15,10 +17,22 @@ export const CreateInterview = mutation({
       jobDescription: args.jobDescription,
       resumeFileName: args.resumeFileName,
       resumeUrl: args.resumeUrl,
+      questions: args.questions,
+      status: args.status ?? "pending",
       createdAt: Date.now(),
     });
 
     return id;
+  },
+});
+
+// Get a single interview by its ID
+export const GetById = query({
+  args: {
+    interviewId: v.id("Interviews"),
+  },
+  async handler(ctx, args) {
+    return await ctx.db.get(args.interviewId);
   },
 });
 
@@ -34,6 +48,19 @@ export const ListByUser = query({
       .collect();
 
     return interviews;
+  },
+});
+
+// Update questions for an interview
+export const UpdateQuestions = mutation({
+  args: {
+    interviewId: v.id("Interviews"),
+    questions: v.string(),
+  },
+  async handler(ctx, args) {
+    await ctx.db.patch(args.interviewId, {
+      questions: args.questions,
+    });
   },
 });
 
