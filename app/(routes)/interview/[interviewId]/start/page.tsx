@@ -5,15 +5,14 @@ import React, {
     useEffect,
     useRef,
     useContext,
-    useCallback,
 } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { useQuery } from "convex/react";
+import { useQuery, useMutation } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { Id } from "@/convex/_generated/dataModel";
 import { UserDetailContext } from "@/context/UserDetailContext";
 import Vapi from "@vapi-ai/web";
-import { Loader2, Volume2, Clock, PhoneOff } from "lucide-react";
+import { Loader2, Volume2, PhoneOff, Mic, Clock, Eye, EyeOff } from "lucide-react";
 
 /* ─── Types ─── */
 interface QuestionItem {
@@ -21,8 +20,39 @@ interface QuestionItem {
     answer?: string;
 }
 
+interface UserAnswer {
+    questionIndex: number;
+    question: string;
+    userAnswer: string;
+    createdAt: number;
+}
+
 /* ─── Constants ─── */
-const QUESTION_TIME_SECONDS = 120;
+const QUESTION_TIME_SECONDS = 60;
+
+/* ─── Eye Gaze Tracking Constants ─── */
+const LEFT_EYE_INNER = 362;
+const LEFT_EYE_OUTER = 263;
+const RIGHT_EYE_INNER = 133;
+const RIGHT_EYE_OUTER = 33;
+const LEFT_IRIS_CENTER = 473;
+const RIGHT_IRIS_CENTER = 468;
+const GAZE_THRESHOLD = 0.35;
+
+/* ─── Voice Command Lists ─── */
+const FORWARD_COMMANDS = [
+    "move to next question", "next", "skip", "go ahead", "continue",
+    "next question", "skip this", "pass", "move on", "let's move on",
+];
+const REPEAT_COMMANDS = [
+    "repeat", "repeat that", "can you repeat", "pardon",
+    "say that again", "come again", "repeat the question",
+];
+const BLOCKED_COMMANDS = [
+    "go back", "previous question", "move to question",
+    "jump to question", "go to question", "question number",
+    "last question", "first question", "back",
+];
 
 export default function LiveInterviewPage() {
     const params = useParams();
@@ -34,28 +64,69 @@ export default function LiveInterviewPage() {
         interviewId: interviewId as Id<"Interviews">,
     });
 
+    const updateFeedback = useMutation(api.Interviews.UpdateFeedback);
+
     /* ─── Refs ─── */
     const videoRef = useRef<HTMLVideoElement>(null);
+    const gazeVideoRef = useRef<HTMLVideoElement>(null);
     const vapiRef = useRef<Vapi | null>(null);
-    const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const callEndedRef = useRef(false);
     const cleanupCalledRef = useRef(false);
+    const faceMeshRef = useRef<any>(null);
+    const questionIndexRef = useRef(0);
 
     /* ─── State ─── */
     const [stream, setStream] = useState<MediaStream | null>(null);
     const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
     const [questions, setQuestions] = useState<QuestionItem[]>([]);
     const [isEnding, setIsEnding] = useState(false);
+
+    // Timer State
     const [timeLeft, setTimeLeft] = useState(QUESTION_TIME_SECONDS);
+    const [timerActive, setTimerActive] = useState(false);
+
+    // Time Expired Overlay
+    const [showTimeExpired, setShowTimeExpired] = useState(false);
+
+    // Answer Recording
+    const [userAnswers, setUserAnswers] = useState<UserAnswer[]>([]);
+    const [currentAnswerTranscript, setCurrentAnswerTranscript] = useState("");
 
     // Vapi / Connection States
     const [vapiConnected, setVapiConnected] = useState(false);
     const [aiIsSpeaking, setAiIsSpeaking] = useState(false);
     const [userIsSpeaking, setUserIsSpeaking] = useState(false);
-    const [timerStarted, setTimerStarted] = useState(false);
 
-    // Live transcript from AI — this is what the question card displays
+    // Live transcript from AI
     const [liveAiText, setLiveAiText] = useState("");
+
+    // Eye Gaze tracking
+    const [isLookingAtScreen, setIsLookingAtScreen] = useState(true);
+    const [gazeReady, setGazeReady] = useState(false);
+
+    /* ─── Keep ref in sync ─── */
+    useEffect(() => {
+        questionIndexRef.current = currentQuestionIndex;
+    }, [currentQuestionIndex]);
+
+    /* ─── Timer Logic ─── */
+    useEffect(() => {
+        let interval: NodeJS.Timeout;
+
+        if (timerActive && timeLeft > 0) {
+            interval = setInterval(() => {
+                setTimeLeft((prev) => {
+                    if (prev <= 1) {
+                        handleTimeUp();
+                        return 0;
+                    }
+                    return prev - 1;
+                });
+            }, 1000);
+        }
+
+        return () => clearInterval(interval);
+    }, [timerActive, timeLeft]);
 
     /* ─── Parse questions from Convex ─── */
     useEffect(() => {
@@ -94,6 +165,110 @@ export default function LiveInterviewPage() {
         }
     }, [stream]);
 
+    /* ─── Eye Gaze Tracking (MediaPipe Tasks Vision) ─── */
+    useEffect(() => {
+        if (!stream) return;
+        let running = true;
+        let timeoutId: ReturnType<typeof setTimeout>;
+        let isProcessing = false;
+
+        const initGazeTracking = async () => {
+            try {
+                const vision = await import("@mediapipe/tasks-vision");
+                const { FaceLandmarker, FilesetResolver } = vision;
+
+                const filesetResolver = await FilesetResolver.forVisionTasks(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+                );
+
+                const faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+                    baseOptions: {
+                        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+                        delegate: "GPU",
+                    },
+                    runningMode: "VIDEO",
+                    numFaces: 1,
+                    outputFacialTransformationMatrixes: false,
+                    outputFaceBlendshapes: false,
+                });
+
+                if (!running) { faceLandmarker.close(); return; }
+
+                faceMeshRef.current = faceLandmarker;
+                setGazeReady(true);
+
+                const gazeVideo = gazeVideoRef.current;
+                if (gazeVideo) {
+                    if (gazeVideo.srcObject !== stream) {
+                        gazeVideo.srcObject = stream;
+                    }
+                    if (gazeVideo.paused) {
+                        try { await gazeVideo.play(); } catch { }
+                    }
+
+                    const processFrame = () => {
+                        if (!running) return;
+
+                        if (!gazeVideo || gazeVideo.readyState < 2 || isProcessing) {
+                            timeoutId = setTimeout(processFrame, 250);
+                            return;
+                        }
+
+                        isProcessing = true;
+                        try {
+                            const results = faceLandmarker.detectForVideo(gazeVideo, performance.now());
+
+                            if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
+                                setIsLookingAtScreen(false);
+                            } else {
+                                const landmarks = results.faceLandmarks[0];
+
+                                const leftInner = landmarks[LEFT_EYE_INNER];
+                                const leftOuter = landmarks[LEFT_EYE_OUTER];
+                                const leftIris = landmarks[LEFT_IRIS_CENTER];
+                                const leftEyeWidth = Math.abs(leftOuter.x - leftInner.x);
+                                const leftIrisPos = leftEyeWidth > 0 ? (leftIris.x - leftInner.x) / leftEyeWidth : 0.5;
+
+                                const rightInner = landmarks[RIGHT_EYE_INNER];
+                                const rightOuter = landmarks[RIGHT_EYE_OUTER];
+                                const rightIris = landmarks[RIGHT_IRIS_CENTER];
+                                const rightEyeWidth = Math.abs(rightInner.x - rightOuter.x);
+                                const rightIrisPos = rightEyeWidth > 0 ? (rightIris.x - rightOuter.x) / rightEyeWidth : 0.5;
+
+                                const avgPos = (leftIrisPos + rightIrisPos) / 2;
+                                const isCentered = avgPos > GAZE_THRESHOLD && avgPos < (1 - GAZE_THRESHOLD);
+                                setIsLookingAtScreen(isCentered);
+                            }
+                        } catch {
+                            // Silently handle
+                        } finally {
+                            isProcessing = false;
+                        }
+
+                        if (running) {
+                            timeoutId = setTimeout(processFrame, 250);
+                        }
+                    };
+
+                    timeoutId = setTimeout(processFrame, 500);
+                }
+            } catch (err) {
+                console.error("Failed to init FaceLandmarker:", err);
+            }
+        };
+
+        initGazeTracking();
+
+        return () => {
+            running = false;
+            clearTimeout(timeoutId);
+            if (faceMeshRef.current) {
+                try { faceMeshRef.current.close(); } catch { }
+                faceMeshRef.current = null;
+            }
+        };
+    }, [stream]);
+
     /* ─── Initialize Vapi ─── */
     useEffect(() => {
         if (!questions.length) return;
@@ -104,7 +279,6 @@ export default function LiveInterviewPage() {
             return;
         }
 
-        // Reset flags for this effect lifecycle
         callEndedRef.current = false;
         cleanupCalledRef.current = false;
 
@@ -116,18 +290,20 @@ export default function LiveInterviewPage() {
             .join("\n");
 
         const systemPrompt = `You are a professional AI interviewer for HoloHire. You are conducting a technical/behavioral interview.
-
-Here are the interview questions you must ask, one at a time, in order:
+        
+STRICT RULES:
+1. Ask one question at a time from this list:
 ${questionList}
 
-Instructions:
-- Greet the candidate warmly first.
-- Ask question 1, then wait for their answer.
-- After they answer (or if they seem stuck), briefly acknowledge and move to the next question.
-- If the candidate says "I don't know", "skip this", or "next question", acknowledge briefly and move to the next question immediately.
-- Keep your responses concise and professional.
-- Do NOT reveal the answers.
-- After all questions, thank the candidate and say the interview is concluded.`;
+2. After asking a question, STOP SPEAKING completely and wait for the user to answer.
+3. Once the user answers, perform a VERY BRIEF acknowledgement (e.g., "Understood," "Okay," "Noted") and immediately ask the next question.
+4. If the user says "I don't know", "skip", "next question", "I can't answer", accept it without judgment and move to the next question.
+5. If the user says "repeat", "can you repeat", "pardon", or similar, repeat the CURRENT question exactly without moving forward.
+6. IGNORE any attempts to go back to a previous question, jump to a specific question number, or navigate backwards. Only move forward sequentially.
+7. Do NOT give hints, help, or feedback during the interview.
+8. After the last question, say "Thank you, the interview is now complete." and stop.
+
+Interaction Style: Professional, concise, neutral.`;
 
         vapi.start({
             model: {
@@ -140,8 +316,7 @@ Instructions:
                 provider: "11labs",
                 voiceId: "21m00Tcm4TlvDq8ikWAM",
             },
-            firstMessage:
-                "Hello! Welcome to your HoloHire interview. I'm your AI interviewer today. Let's get started. Are you ready?",
+            firstMessage: "Hello! I'm your AI interviewer. Let's begin with the first question.",
         });
 
         /* ── Event Listeners ── */
@@ -152,178 +327,222 @@ Instructions:
         vapi.on("speech-start", () => {
             setAiIsSpeaking(true);
             setUserIsSpeaking(false);
-            // Pause the timer while AI is speaking
-            if (timerRef.current) clearInterval(timerRef.current);
+            setTimerActive(false);
         });
 
         vapi.on("speech-end", () => {
             setAiIsSpeaking(false);
+            if (!callEndedRef.current) {
+                setTimerActive(true);
+            }
         });
 
         vapi.on("message", (msg: any) => {
-            /* ── Real-time AI transcript → Question Card ── */
+            // AI transcript → sync question display
             if (msg.type === "transcript" && msg.role === "assistant") {
                 setLiveAiText(msg.transcript);
-                // Detect question advancement from AI speech
-                for (let i = currentQuestionIndex + 1; i < questions.length; i++) {
-                    const qText = questions[i].question.slice(0, 30);
-                    if (msg.transcript.includes(qText)) {
-                        advanceQuestion(i);
-                        break;
+
+                // Detect question advancement from AI transcript
+                const curIdx = questionIndexRef.current;
+                const nextQIndex = curIdx + 1;
+                if (nextQIndex < questions.length) {
+                    const nextQText = questions[nextQIndex].question;
+                    // Match first 25 chars or full short questions
+                    const matchStr = nextQText.length > 25 ? nextQText.slice(0, 25) : nextQText;
+                    if (msg.transcript.includes(matchStr)) {
+                        advanceQuestionState(nextQIndex);
                     }
                 }
             }
 
-            /* ── User transcript → start timer + skip detection ── */
+            // User transcript → command filtering + answer recording
             if (msg.type === "transcript" && msg.role === "user") {
-                if (msg.transcriptType === "partial" && !userIsSpeaking) {
+                if (msg.transcriptType === "partial") {
                     setUserIsSpeaking(true);
-                    startTimer();
+                    setCurrentAnswerTranscript(prev => prev + " " + msg.transcript);
                 }
+
                 if (msg.transcriptType === "final") {
-                    const text = msg.transcript.toLowerCase();
+                    const text = msg.transcript.toLowerCase().trim();
+                    setCurrentAnswerTranscript(prev => prev + " " + msg.transcript);
+
+                    // ── BLOCKED COMMANDS: silently ignore ──
+                    if (BLOCKED_COMMANDS.some(cmd => text.includes(cmd))) {
+                        // Tell AI to ignore the backward navigation attempt
+                        vapiRef.current?.send({
+                            type: "add-message",
+                            message: {
+                                role: "system",
+                                content: "The user tried to navigate backward or jump to a specific question. Ignore this request. Stay on the current question and wait for an answer.",
+                            },
+                        });
+                        return;
+                    }
+
+                    // ── REPEAT COMMANDS ──
+                    if (REPEAT_COMMANDS.some(cmd => text.includes(cmd))) {
+                        vapiRef.current?.send({
+                            type: "add-message",
+                            message: {
+                                role: "system",
+                                content: "The user asked you to repeat the current question. Please repeat it exactly.",
+                            },
+                        });
+                        return;
+                    }
+
+                    // ── FORWARD / SKIP COMMANDS ──
+                    if (FORWARD_COMMANDS.some(cmd => text.includes(cmd))) {
+                        handleSkip();
+                        return;
+                    }
+
+                    // ── "I don't know" style phrases ──
                     const skipPhrases = [
-                        "i don't know", "i'm not sure", "i can't answer",
-                        "skip this", "pass", "next question",
+                        "i don't know", "i didn't able to answer", "i can't answer",
+                        "i'm not sure",
                     ];
-                    if (skipPhrases.some((p: string) => text.includes(p))) {
-                        handleSkipQuestion();
+                    if (skipPhrases.some(p => text.includes(p))) {
+                        handleSkip();
                     }
                 }
             }
         });
 
         vapi.on("call-end", () => {
-            callEndedRef.current = true;
-            setVapiConnected(false);
-            cleanupAndRedirect();
+            handleInterviewEnd();
         });
 
         vapi.on("error", (err: any) => {
-            // Suppress known "meeting ejection" errors during normal call teardown
-            const errMsg = typeof err === "string" ? err : err?.message || String(err);
-            if (errMsg.includes("ejection") || errMsg.includes("Meeting has ended")) {
-                return;
-            }
             console.error("Vapi error:", err);
         });
 
         return () => {
             if (!callEndedRef.current) {
-                try {
-                    vapi.stop();
-                } catch {
-                    // Call already ended — safe to ignore
-                }
+                try { vapi.stop(); } catch { }
             }
         };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [questions]);
 
-    /* ─── Timer Logic ─── */
-    const startTimer = useCallback(() => {
-        if (timerRef.current) clearInterval(timerRef.current);
-        if (!timerStarted) {
-            setTimerStarted(true);
-            setTimeLeft(QUESTION_TIME_SECONDS);
-        }
+    /* ─── Logic ─── */
 
-        timerRef.current = setInterval(() => {
-            setTimeLeft((prev) => {
-                if (prev <= 1) {
-                    if (timerRef.current) clearInterval(timerRef.current);
-                    handleTimerExpired();
-                    return QUESTION_TIME_SECONDS;
-                }
-                return prev - 1;
-            });
-        }, 1000);
-    }, [timerStarted]);
+    const handleTimeUp = () => {
+        setTimerActive(false);
 
-    const handleTimerExpired = () => {
-        const next = currentQuestionIndex + 1;
+        // Show Time Expired system message
+        setShowTimeExpired(true);
+
+        vapiRef.current?.send({
+            type: "add-message",
+            message: {
+                role: "system",
+                content: "Time is up for this question. Moving to the next question immediately.",
+            },
+        });
+
+        saveCurrentAnswer("Time Expired / No Answer");
+
+        const next = questionIndexRef.current + 1;
         if (next < questions.length) {
-            vapiRef.current?.send({
-                type: "add-message",
-                message: {
-                    role: "system",
-                    content: `Time is up. Move to question ${next + 1}: "${questions[next].question}"`,
-                },
-            });
-            advanceQuestion(next);
+            // 2 second delay then advance
+            setTimeout(() => {
+                setShowTimeExpired(false);
+                advanceQuestionState(next);
+            }, 2000);
         } else {
-            vapiRef.current?.send({
-                type: "add-message",
-                message: {
-                    role: "system",
-                    content: "Time is up for the final question. Conclude the interview.",
-                },
-            });
+            // Last question → end interview after delay
+            setTimeout(() => {
+                setShowTimeExpired(false);
+                handleInterviewEnd();
+            }, 2000);
         }
     };
 
-    const handleSkipQuestion = () => {
-        const next = currentQuestionIndex + 1;
+    const handleSkip = () => {
+        saveCurrentAnswer("Skipped / I don't know");
+
+        vapiRef.current?.send({
+            type: "add-message",
+            message: {
+                role: "system",
+                content: "User skipped. Ask the next question immediately.",
+            },
+        });
+
+        const next = questionIndexRef.current + 1;
         if (next < questions.length) {
-            vapiRef.current?.send({
-                type: "add-message",
-                message: {
-                    role: "system",
-                    content: "User requested to skip. Acknowledge briefly and ask the next question immediately.",
-                },
-            });
-            advanceQuestion(next);
+            advanceQuestionState(next);
+        } else {
+            handleInterviewEnd();
         }
     };
 
-    const advanceQuestion = (idx: number) => {
-        setCurrentQuestionIndex(idx);
+    const advanceQuestionState = (index: number) => {
+        if (index === questionIndexRef.current) return;
+
+        if (questionIndexRef.current < index) {
+            saveCurrentAnswer(currentAnswerTranscript || "No answer detected");
+        }
+
+        setCurrentQuestionIndex(index);
         setTimeLeft(QUESTION_TIME_SECONDS);
-        setUserIsSpeaking(false);
-        setTimerStarted(false);
+        setTimerActive(false);
         setLiveAiText("");
-        if (timerRef.current) clearInterval(timerRef.current);
+        setCurrentAnswerTranscript("");
     };
 
-    /* ─── Cleanup ─── */
-    const cleanupAndRedirect = () => {
-        if (cleanupCalledRef.current) return;
-        cleanupCalledRef.current = true;
-        if (timerRef.current) clearInterval(timerRef.current);
-        stream?.getTracks().forEach((t) => t.stop());
-        router.push("/dashboard");
+    const saveCurrentAnswer = (answerText: string) => {
+        const idx = questionIndexRef.current;
+        setUserAnswers(prev => {
+            const existing = prev.find(a => a.questionIndex === idx);
+            if (existing) return prev;
+
+            return [
+                ...prev,
+                {
+                    questionIndex: idx,
+                    question: questions[idx]?.question || "",
+                    userAnswer: answerText,
+                    createdAt: Date.now(),
+                }
+            ];
+        });
     };
 
-    const handleEnd = () => {
+    const handleInterviewEnd = async () => {
+        if (callEndedRef.current || isEnding) return;
+        callEndedRef.current = true;
         setIsEnding(true);
-        vapiRef.current?.stop();
-        setTimeout(cleanupAndRedirect, 800);
+        setTimerActive(false);
+
+        saveCurrentAnswer(currentAnswerTranscript || "Interview Ended");
+
+        try { vapiRef.current?.stop(); } catch { }
+
+        // Save to Convex
+        try {
+            await updateFeedback({
+                interviewId: interviewId as Id<"Interviews">,
+                answers: JSON.stringify(userAnswers),
+                feedback: JSON.stringify([]),
+                status: "completed",
+            });
+            router.push(`/dashboard`);
+        } catch (err) {
+            console.error("Failed to save interview:", err);
+            router.push(`/dashboard`);
+        }
     };
 
-    /* ─── Helpers ─── */
-    const userName = user?.fullName || user?.firstName || "Candidate";
-    const userImageUrl = user?.imageUrl;
-
-    const formatTime = (s: number) => {
-        const m = Math.floor(s / 60);
-        const sec = s % 60;
-        return `${m}:${sec.toString().padStart(2, "0")}`;
+    /* ─── UI Helpers ─── */
+    const formatTime = (seconds: number) => {
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
     };
 
-    const currentQuestion = questions[currentQuestionIndex]?.question ?? "";
-    // Show live AI text if available, otherwise show the stored question
-    const displayedQuestion = liveAiText || currentQuestion;
+    const displayedQuestion = questions[currentQuestionIndex]?.question || "Connecting to Interviewer...";
 
-    const timerColor =
-        timeLeft <= 15 ? "text-red-400" :
-            timeLeft <= 30 ? "text-amber-400" :
-                "text-white";
-    const timerBg =
-        timeLeft <= 15 ? "bg-red-500/15 border-red-500/30" :
-            timeLeft <= 30 ? "bg-amber-500/15 border-amber-500/30" :
-                "bg-white/5 border-white/10";
-
-    /* ─── Loading ─── */
     if (!interview) {
         return (
             <div className="flex min-h-screen items-center justify-center bg-[#0a0e17]">
@@ -333,82 +552,98 @@ Instructions:
     }
 
     return (
-        <div className="flex h-screen flex-col bg-[#0a0e17] text-white overflow-hidden">
+        <div className="flex h-screen flex-col bg-[#0a0e17] text-white overflow-hidden font-sans">
             {/* ── Header ── */}
-            <header className="shrink-0 border-b border-white/5 bg-[#0a0e17]/90 backdrop-blur-lg px-6 py-3">
+            <header className="shrink-0 border-b border-white/5 bg-[#0a0e17]/90 backdrop-blur-lg px-6 py-4">
                 <div className="flex items-center justify-between max-w-7xl mx-auto">
-                    {/* Left: Brand */}
                     <div className="flex items-center gap-3">
-                        <svg width="28" height="28" viewBox="0 0 36 36" fill="none">
-                            <circle cx="14" cy="18" r="11" fill="#3B82F6" opacity="0.6" />
-                            <circle cx="22" cy="18" r="11" fill="#60A5FA" />
-                        </svg>
-                        <span className="text-lg font-bold tracking-tight">HoloHire</span>
-                        {questions.length > 0 && (
-                            <span className="ml-2 text-xs font-medium text-gray-500">
-                                Q{currentQuestionIndex + 1}/{questions.length}
+                        <div className="size-8 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center">
+                            <span className="font-bold text-white text-lg">H</span>
+                        </div>
+                        <span className="text-lg font-bold tracking-tight">HoloHire Interview</span>
+                        <div className="px-2.5 py-0.5 rounded-full bg-white/5 border border-white/10 text-xs font-medium text-gray-400 ml-2">
+                            Question {currentQuestionIndex + 1} of {questions.length}
+                        </div>
+                    </div>
+
+                    {/* Timer & End Controls */}
+                    <div className="flex items-center gap-6">
+                        {/* ── Minimal Text Timer (replaces blue circle) ── */}
+                        <div className="flex flex-col items-end">
+                            <span className="text-[10px] font-medium text-gray-500 uppercase tracking-widest mb-0.5">Time Remaining</span>
+                            <span className={`text-lg font-mono font-semibold tracking-wider ${timeLeft <= 10 ? "text-red-400" : "text-gray-300"}`}>
+                                {formatTime(timeLeft)}
                             </span>
-                        )}
-                    </div>
+                        </div>
 
-                    {/* Center: Answer Timer (replaces Live indicator) */}
-                    <div className={`flex items-center gap-2.5 px-4 py-2 rounded-full border transition-all duration-300 ${timerBg}`}>
-                        <Clock className={`size-4 ${timerColor}`} />
-                        <span className={`font-mono text-sm font-bold tabular-nums ${timerColor}`}>
-                            {formatTime(timeLeft)}
-                        </span>
-                        {timerStarted && (
-                            <div className="size-2 rounded-full bg-green-500 animate-pulse" />
-                        )}
-                    </div>
+                        <div className="h-8 w-px bg-white/10" />
 
-                    {/* Right: End Interview */}
-                    <button
-                        onClick={handleEnd}
-                        disabled={isEnding}
-                        className="flex items-center gap-2 rounded-full border border-red-500/30 bg-red-500/10 px-5 py-2 text-sm font-semibold text-red-400 transition-all hover:bg-red-500/20 hover:border-red-500/50 hover:text-red-300 disabled:opacity-50 disabled:pointer-events-none"
-                    >
-                        {isEnding ? (
-                            <Loader2 className="size-4 animate-spin" />
-                        ) : (
-                            <PhoneOff className="size-4" />
+                        {/* Eye Gaze Status */}
+                        {gazeReady && (
+                            <>
+                                <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/[0.06]"
+                                    title="Eye gaze tracking may be less accurate with glasses, low lighting, dark irises, or extreme camera angles."
+                                >
+                                    <div className={`size-2 rounded-full ${isLookingAtScreen ? "bg-emerald-500" : "bg-red-500"} animate-pulse`} />
+                                    <span className="text-xs font-medium text-gray-400">
+                                        {isLookingAtScreen ? "Looking at screen" : "Looking away"}
+                                    </span>
+                                    {isLookingAtScreen ? (
+                                        <Eye className="size-3.5 text-emerald-500" />
+                                    ) : (
+                                        <EyeOff className="size-3.5 text-red-400" />
+                                    )}
+                                </div>
+                                <div className="h-8 w-px bg-white/10" />
+                            </>
                         )}
-                        {isEnding ? "Ending…" : "End Interview"}
-                    </button>
+
+                        <button
+                            onClick={() => handleInterviewEnd()}
+                            className="group flex items-center gap-2 px-4 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm font-medium transition hover:bg-red-500/20 hover:border-red-500/40"
+                        >
+                            <PhoneOff className="size-4 transition-transform group-hover:rotate-90" />
+                            <span>End Session</span>
+                        </button>
+                    </div>
                 </div>
             </header>
 
-            {/* ── Main: Two Side-by-Side Cards ── */}
-            <main className="flex-1 flex flex-col min-h-0 p-4 gap-4">
-                <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4 min-h-0">
+            {/* ── Main Content ── */}
+            <main className="flex-1 p-6 flex flex-col gap-6 max-w-7xl mx-auto w-full">
 
-                    {/* ── AI Interviewer Card ── */}
-                    <div className="relative flex flex-col items-center justify-center rounded-2xl bg-gradient-to-br from-[#1e293b] to-[#0f172a] border border-white/10 overflow-hidden">
-                        {/* Background Glow */}
-                        <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_30%,rgba(56,189,248,0.08),transparent_60%)]" />
+                <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-6 min-h-0">
+                    {/* AI Video Area */}
+                    <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-[#0f1629] shadow-2xl shadow-black/50">
+                        <div className="absolute inset-0 bg-gradient-to-b from-transparent to-black/60 z-10" />
 
-                        {/* Avatar + Name */}
-                        <div className="relative flex flex-col items-center gap-5 z-10">
+                        <div className="absolute inset-0 flex flex-col items-center justify-center z-20 gap-6">
                             <div className="relative">
-                                <div className={`flex size-28 items-center justify-center rounded-full bg-white/10 backdrop-blur-sm border border-white/20 transition-all duration-300 ${aiIsSpeaking ? 'scale-105 shadow-[0_0_50px_rgba(59,130,246,0.4)]' : ''}`}>
-                                    <Volume2 className={`size-10 text-cyan-400 transition-transform duration-300 ${aiIsSpeaking ? 'scale-110' : ''}`} />
-                                </div>
                                 {aiIsSpeaking && (
                                     <>
-                                        <div className="absolute inset-0 rounded-full border-2 border-cyan-500/40 animate-[ping_1.5s_ease-in-out_infinite]" />
-                                        <div className="absolute inset-0 rounded-full border border-cyan-500/20 animate-[ping_2s_ease-in-out_infinite_0.5s]" />
+                                        <div className="absolute inset-0 rounded-full border border-cyan-500/30 animate-[ping_2s_linear_infinite]" />
+                                        <div className="absolute inset-0 rounded-full border border-cyan-400/20 animate-[ping_1.5s_linear_infinite_0.5s]" />
                                     </>
                                 )}
+                                <div className={`relative z-10 flex size-32 items-center justify-center rounded-full bg-gradient-to-b from-[#1e293b] to-[#0f172a] border border-white/10 shadow-xl transition-transform duration-300 ${aiIsSpeaking ? 'scale-105 border-cyan-500/50 shadow-cyan-500/20' : ''}`}>
+                                    <Volume2 className={`size-12 ${aiIsSpeaking ? 'text-cyan-400' : 'text-gray-500'}`} />
+                                </div>
                             </div>
-                            <div className="text-center">
-                                <h3 className="text-xl font-bold text-white">AI Interviewer</h3>
-                                <p className="text-xs text-gray-500 mt-0.5">HoloHire Assistant</p>
+
+                            <div className="text-center space-y-1">
+                                <h3 className="text-2xl font-bold text-white tracking-tight">AI Interviewer</h3>
+                                <div className="flex items-center justify-center gap-2">
+                                    <div className={`size-2 rounded-full ${aiIsSpeaking ? 'bg-green-500 animate-pulse' : 'bg-gray-600'}`} />
+                                    <span className="text-sm font-medium text-gray-400">
+                                        {aiIsSpeaking ? "Speaking..." : "Listening"}
+                                    </span>
+                                </div>
                             </div>
                         </div>
                     </div>
 
-                    {/* ── User Webcam Card ── */}
-                    <div className="relative rounded-2xl bg-[#111827] border border-white/10 overflow-hidden">
+                    {/* User Video Area — single camera only */}
+                    <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-[#111827] shadow-2xl shadow-black/50 group">
                         {stream ? (
                             <video
                                 ref={videoRef}
@@ -418,55 +653,91 @@ Instructions:
                                 className="size-full object-cover scale-x-[-1]"
                             />
                         ) : (
-                            <div className="flex size-full items-center justify-center bg-[#1f2937]">
-                                <Loader2 className="size-8 animate-spin text-gray-500" />
+                            <div className="flex size-full items-center justify-center">
+                                <Loader2 className="size-8 animate-spin text-gray-600" />
                             </div>
                         )}
 
-                        {/* Name Badge */}
-                        <div className="absolute bottom-4 left-4">
-                            <div className="bg-black/50 backdrop-blur-md rounded-lg px-3 py-1.5 border border-white/10 flex items-center gap-2">
-                                {userImageUrl ? (
-                                    <img src={userImageUrl} alt="User" className="size-5 rounded-full" />
-                                ) : (
-                                    <div className="size-5 rounded-full bg-cyan-500 flex items-center justify-center text-[9px] font-bold">
-                                        {userName.charAt(0)}
-                                    </div>
-                                )}
-                                <span className="text-xs font-medium">{userName}</span>
+                        {/* Hidden video for gaze processing — not rendered visually */}
+                        <video
+                            ref={gazeVideoRef}
+                            autoPlay
+                            muted
+                            playsInline
+                            style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none", overflow: "hidden" }}
+                        />
+
+                        {/* Status Overlay */}
+                        <div className="absolute top-4 right-4 z-10 flex gap-2">
+                            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/60 backdrop-blur border border-white/10 text-xs font-medium text-white">
+                                <div className="size-2 rounded-full bg-red-500 animate-pulse" />
+                                REC
+                            </div>
+                        </div>
+
+                        {/* Gaze indicator overlay on camera */}
+                        {gazeReady && (
+                            <div className="absolute top-4 left-4 z-10">
+                                <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full backdrop-blur-md text-[10px] font-bold uppercase tracking-wider border transition-colors duration-300 ${isLookingAtScreen
+                                    ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-400"
+                                    : "bg-red-500/15 border-red-500/30 text-red-400"
+                                    }`}>
+                                    <div className={`size-1.5 rounded-full ${isLookingAtScreen ? "bg-emerald-400" : "bg-red-400"}`} />
+                                    {isLookingAtScreen ? "Focused" : "Distracted"}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Mic Indicator */}
+                        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-10">
+                            <div className={`flex items-center gap-3 px-6 py-3 rounded-full backdrop-blur-md border transition-all duration-300 ${showTimeExpired
+                                ? 'bg-red-500/20 border-red-500/40 text-red-400 opacity-50 pointer-events-none'
+                                : userIsSpeaking
+                                    ? 'bg-green-500/20 border-green-500/40 text-green-400'
+                                    : 'bg-black/40 border-white/10 text-gray-400'
+                                }`}>
+                                <Mic className={`size-5 ${userIsSpeaking && !showTimeExpired ? 'animate-bounce' : ''}`} />
+                                <span className="text-sm font-semibold">
+                                    {showTimeExpired ? "Input Disabled" : userIsSpeaking ? "Speaking..." : "Mic Active"}
+                                </span>
                             </div>
                         </div>
                     </div>
                 </div>
 
-                {/* ── Current Question Bar (synced to AI speech) ── */}
-                <div className={`shrink-0 rounded-xl border transition-all duration-500 ${aiIsSpeaking
-                    ? 'border-cyan-500/30 bg-cyan-500/5'
-                    : 'border-white/10 bg-white/[0.03]'
-                    }`}>
-                    <div className="px-6 py-4 flex items-start gap-4">
-                        <div className="shrink-0 mt-0.5">
-                            <div className={`flex size-8 items-center justify-center rounded-full transition-colors duration-300 ${aiIsSpeaking ? 'bg-cyan-500/20' : 'bg-white/5'
-                                }`}>
-                                <Volume2 className={`size-4 transition-colors duration-300 ${aiIsSpeaking ? 'text-cyan-400 animate-pulse' : 'text-gray-500'
-                                    }`} />
+                {/* Footer: Question Card — synced to centralized questionIndex */}
+                <div className="w-full shrink-0 relative">
+                    <div className="relative overflow-hidden rounded-xl border border-white/10 bg-white/[0.03] p-6 lg:p-8 backdrop-blur-sm transition-all hover:bg-white/[0.05]">
+                        <div className="flex items-start gap-4">
+                            <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 font-bold text-lg">
+                                Q{currentQuestionIndex + 1}
+                            </div>
+                            <div className="flex-1 space-y-2">
+                                <div className="flex items-center justify-between">
+                                    <h4 className="text-sm font-medium text-gray-400 uppercase tracking-widest">Current Question</h4>
+                                    {liveAiText && <span className="text-xs text-cyan-400 animate-pulse">Live Transcript</span>}
+                                </div>
+                                <p className="text-xl lg:text-2xl font-medium leading-relaxed text-white">
+                                    {displayedQuestion}
+                                </p>
                             </div>
                         </div>
-                        <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2 mb-1">
-                                <span className="text-[10px] font-bold text-cyan-400 tracking-widest uppercase">
-                                    Question {currentQuestionIndex + 1} of {questions.length}
-                                </span>
-                                {aiIsSpeaking && (
-                                    <span className="text-[10px] text-cyan-400/60 font-medium">● Speaking</span>
-                                )}
+
+                        {/* ── TIME EXPIRED OVERLAY ── */}
+                        {showTimeExpired && (
+                            <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 backdrop-blur-sm rounded-xl animate-in fade-in duration-300">
+                                <div className="flex items-center gap-3 px-6 py-4 rounded-xl bg-red-500/15 border border-red-500/30">
+                                    <Clock className="size-6 text-red-400" />
+                                    <div>
+                                        <p className="text-lg font-bold text-red-400">Time Expired</p>
+                                        <p className="text-sm text-gray-400">Moving to next question...</p>
+                                    </div>
+                                </div>
                             </div>
-                            <p className="text-sm text-gray-200 leading-relaxed">
-                                {displayedQuestion || "Waiting for the interviewer..."}
-                            </p>
-                        </div>
+                        )}
                     </div>
                 </div>
+
             </main>
         </div>
     );

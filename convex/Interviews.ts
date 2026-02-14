@@ -77,6 +77,23 @@ export const UpdateInterviewName = mutation({
   },
 });
 
+// Update feedback and answers for an interview
+export const UpdateFeedback = mutation({
+  args: {
+    interviewId: v.id("Interviews"),
+    feedback: v.string(),
+    answers: v.string(),
+    status: v.string(),
+  },
+  async handler(ctx, args) {
+    await ctx.db.patch(args.interviewId, {
+      feedback: args.feedback,
+      answers: args.answers,
+      status: args.status,
+    });
+  },
+});
+
 // Delete an interview
 export const DeleteInterview = mutation({
   args: {

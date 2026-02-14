@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { UserDetailContext } from "@/context/UserDetailContext";
 import CreateInterviewDialog from "./_components/CreateInterviewDialog";
 import InterviewCard from "./_components/InterviewCard";
+import RecentInterviewResults from "./_components/RecentInterviewResults";
 
 export default function DashboardPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -43,7 +44,15 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      <main className="mx-auto flex w-full max-w-7xl flex-1 flex-col items-center justify-center gap-10 px-6 py-16 lg:px-8">
+      <main className="mx-auto flex w-full max-w-7xl flex-1 flex-col items-center gap-10 px-6 py-16 lg:px-8">
+
+        {/* ── Recent Interview Results ── */}
+        {hasInterviews && (
+          <RecentInterviewResults
+            interviews={interviews as any}
+            userName={user?.fullName ?? user?.firstName ?? "Candidate"}
+          />
+        )}
 
         {/* ── Empty-state / create-another banner ── */}
         <div

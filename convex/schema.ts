@@ -15,5 +15,7 @@ export default defineSchema({
     questions: v.optional(v.string()),
     status: v.optional(v.string()),
     createdAt: v.number(),
+    feedback: v.optional(v.string()), // JSON string of feedback
+    answers: v.optional(v.string()), // JSON string of user answers
   }),
 });
