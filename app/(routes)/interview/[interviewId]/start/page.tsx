@@ -74,11 +74,13 @@ export default function LiveInterviewPage() {
     const cleanupCalledRef = useRef(false);
     const faceMeshRef = useRef<any>(null);
     const questionIndexRef = useRef(0);
+    const questionsRef = useRef<QuestionItem[]>([]);
 
     /* ─── State ─── */
     const [stream, setStream] = useState<MediaStream | null>(null);
     const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
     const [questions, setQuestions] = useState<QuestionItem[]>([]);
+    const [questionsReady, setQuestionsReady] = useState(false);
     const [isEnding, setIsEnding] = useState(false);
 
     // Timer State
@@ -109,6 +111,25 @@ export default function LiveInterviewPage() {
         questionIndexRef.current = currentQuestionIndex;
     }, [currentQuestionIndex]);
 
+    /* ─── Persistent console.error filter for noisy library messages ─── */
+    useEffect(() => {
+        const origError = console.error;
+        const suppressedPatterns = [
+            "TensorFlow Lite XNNPACK",
+            "Created TensorFlow Lite",
+            "Ignoring settings for browser",
+            "unsupported input processor",
+            "Meeting ended due to ejection",
+            "Meeting has ended",
+        ];
+        console.error = (...args: any[]) => {
+            const msg = args.length > 0 ? String(args[0]) : "";
+            if (suppressedPatterns.some(p => msg.includes(p))) return;
+            origError.apply(console, args);
+        };
+        return () => { console.error = origError; };
+    }, []);
+
     /* ─── Timer Logic ─── */
     useEffect(() => {
         let interval: NodeJS.Timeout;
@@ -134,6 +155,8 @@ export default function LiveInterviewPage() {
             try {
                 const parsed = JSON.parse(interview.questions);
                 setQuestions(parsed);
+                questionsRef.current = parsed;
+                if (parsed.length > 0) setQuestionsReady(true);
             } catch {
                 setQuestions([]);
             }
@@ -269,9 +292,12 @@ export default function LiveInterviewPage() {
         };
     }, [stream]);
 
-    /* ─── Initialize Vapi ─── */
+    /* ─── Initialize Vapi (only once when questions are first available) ─── */
     useEffect(() => {
-        if (!questions.length) return;
+        if (!questionsReady) return;
+
+        const qs = questionsRef.current;
+        if (!qs.length) return;
 
         const publicKey = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY;
         if (!publicKey) {
@@ -285,7 +311,7 @@ export default function LiveInterviewPage() {
         const vapi = new Vapi(publicKey);
         vapiRef.current = vapi;
 
-        const questionList = questions
+        const questionList = qs
             .map((q, i) => `${i + 1}. ${q.question}`)
             .join("\n");
 
@@ -345,8 +371,9 @@ Interaction Style: Professional, concise, neutral.`;
                 // Detect question advancement from AI transcript
                 const curIdx = questionIndexRef.current;
                 const nextQIndex = curIdx + 1;
-                if (nextQIndex < questions.length) {
-                    const nextQText = questions[nextQIndex].question;
+                const currentQs = questionsRef.current;
+                if (nextQIndex < currentQs.length) {
+                    const nextQText = currentQs[nextQIndex].question;
                     // Match first 25 chars or full short questions
                     const matchStr = nextQText.length > 25 ? nextQText.slice(0, 25) : nextQText;
                     if (msg.transcript.includes(matchStr)) {
@@ -414,6 +441,10 @@ Interaction Style: Professional, concise, neutral.`;
         });
 
         vapi.on("error", (err: any) => {
+            // Skip empty error objects and known non-actionable errors
+            if (!err || (typeof err === "object" && Object.keys(err).length === 0)) return;
+            const errMsg = typeof err === "string" ? err : JSON.stringify(err);
+            if (errMsg.includes("Meeting has ended") || errMsg.includes("ejection")) return;
             console.error("Vapi error:", err);
         });
 
@@ -422,7 +453,7 @@ Interaction Style: Professional, concise, neutral.`;
                 try { vapi.stop(); } catch { }
             }
         };
-    }, [questions]);
+    }, [questionsReady]);
 
     /* ─── Logic ─── */
 
